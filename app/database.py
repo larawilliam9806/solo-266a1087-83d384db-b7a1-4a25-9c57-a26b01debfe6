@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS readings (
     start_ts    INTEGER NOT NULL,
     end_ts      INTEGER NOT NULL,
     db_value    REAL NOT NULL,
+    quarantined INTEGER NOT NULL DEFAULT 0,
     created_at  INTEGER NOT NULL
 );
 
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS calibrations (
     end_ts      INTEGER NOT NULL,
     offset_db   REAL NOT NULL,
     withdrawn   INTEGER NOT NULL DEFAULT 0,
+    quarantined INTEGER NOT NULL DEFAULT 0,
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
 );
@@ -62,6 +64,29 @@ CREATE TABLE IF NOT EXISTS hourly_results (
     PRIMARY KEY (point, hour_start)
 );
 """
+
+# 旧库迁移：启动隔离功能为两张单据表新增的列。
+# SQLite 的 ADD COLUMN 只支持常量默认值，逐列检查、缺失再补，保证 init_db 幂等。
+_COLUMN_MIGRATIONS = (
+    (
+        "readings",
+        "quarantined",
+        "ALTER TABLE readings ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "calibrations",
+        "quarantined",
+        "ALTER TABLE calibrations ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
+    ),
+)
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """为旧库补齐新增列（新库建表时已包含，自动跳过）。"""
+    for table, column, ddl in _COLUMN_MIGRATIONS:
+        names = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in names:
+            conn.execute(ddl)
 
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
@@ -84,12 +109,13 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | None = None) -> None:
-    """初始化数据库文件与表结构（幂等）。"""
+    """初始化数据库文件与表结构（幂等），并为旧库补齐新增列。"""
     path = db_path or str(get_db_path())
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _ensure_columns(conn)
     finally:
         conn.close()
 

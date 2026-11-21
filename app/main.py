@@ -1,6 +1,7 @@
 """FastAPI 应用与路由。"""
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 
@@ -26,9 +27,27 @@ from .time_utils import (
     parse_hour_param,
 )
 
+logger = logging.getLogger(__name__)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    # 启动时隔离旧库中残存的非有限读数 / 校准单，并只重算受影响的小时。
+    # 隔离与重算在同一事务内生效；失败则整体回滚，保留原有记录与结果，
+    # 服务启动失败，下次启动自动重试（隔离逻辑幂等）。
+    conn = connect()
+    try:
+        with write_transaction(conn):
+            stats = services.quarantine_non_finite(conn)
+    finally:
+        conn.close()
+    if stats["readings"] or stats["calibrations"]:
+        logger.warning(
+            "已隔离非有限单据：读数 %s，校准单 %s",
+            stats["readings"],
+            stats["calibrations"],
+        )
     yield
 
 
@@ -89,8 +108,8 @@ def health() -> dict[str, str]:
     status_code=status.HTTP_200_OK,
     tags=["读数"],
     responses={
-        409: {"model": MessageOut, "description": "同号内容不同，或同仪器区间重叠"},
-        400: {"model": MessageOut, "description": "区间 / 时间格式不合法"},
+        409: {"model": MessageOut, "description": "同号内容不同、编号已隔离，或同仪器区间重叠"},
+        400: {"model": MessageOut, "description": "区间 / 时间格式不合法，或分贝值为非有限值"},
     },
 )
 def put_reading(
@@ -126,8 +145,8 @@ def get_readings(
     response_model=CalibrationOut,
     tags=["校准单"],
     responses={
-        409: {"model": MessageOut, "description": "区间重叠，或校准单已撤回"},
-        400: {"model": MessageOut, "description": "区间 / 时间格式不合法"},
+        409: {"model": MessageOut, "description": "区间重叠、编号已隔离，或校准单已撤回"},
+        400: {"model": MessageOut, "description": "区间 / 时间格式不合法，或偏移为非有限值"},
     },
 )
 def put_calibration(

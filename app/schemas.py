@@ -46,15 +46,22 @@ class CalibrationIn(IntervalIn):
 
 
 class ReadingOut(BaseModel):
+    # 被隔离记录的非有限值按 JSON 常量（-Infinity / Infinity / NaN）输出，
+    # 调用方仍能读到原始的异常值。
+    model_config = ConfigDict(ser_json_inf_nan="constants")
+
     number: str
     point: str
     role: Role
     start: str
     end: str
     db: float
+    quarantined: bool
 
 
 class CalibrationOut(BaseModel):
+    model_config = ConfigDict(ser_json_inf_nan="constants")
+
     number: str
     point: str
     role: Role
@@ -62,6 +69,7 @@ class CalibrationOut(BaseModel):
     end: str
     offset: float
     withdrawn: bool
+    quarantined: bool
 
 
 class HourlyResultOut(BaseModel):

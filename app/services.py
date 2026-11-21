@@ -16,6 +16,10 @@ from .time_utils import SECONDS_PER_HOUR, format_epoch_second, hours_touching
 # dB 转声能时的参考基准，公共因子在平均后会抵消。
 _ENERGY_REF_FACTOR = 0.1
 
+# 有限 REAL 的绝对值上限远在 1e307 之上（双精度约 1.8e308），
+# 用该界做 SQL 预筛找出 ±Inf，再用 math.isfinite 复核，避免误伤有限的极大值。
+_FINITE_ABS_BOUND = 1.0e307
+
 
 class ServiceError(Exception):
     """服务层业务错误基类。"""
@@ -65,6 +69,7 @@ def reading_out(row: sqlite3.Row) -> dict:
         "start": format_epoch_second(row["start_ts"]),
         "end": format_epoch_second(row["end_ts"]),
         "db": row["db_value"],
+        "quarantined": bool(row["quarantined"]),
     }
 
 
@@ -77,6 +82,7 @@ def calibration_out(row: sqlite3.Row) -> dict:
         "end": format_epoch_second(row["end_ts"]),
         "offset": row["offset_db"],
         "withdrawn": bool(row["withdrawn"]),
+        "quarantined": bool(row["quarantined"]),
     }
 
 
@@ -88,6 +94,12 @@ def _validate_interval(start_ts: int, end_ts: int) -> None:
         raise ValidationError("区间必须满足 start < end，且为左闭右开的整秒区间")
 
 
+def _validate_finite(value: float, label: str) -> None:
+    """分贝值 / 校准偏移必须是有限数值，NaN 与 ±Inf 一律拒收。"""
+    if not math.isfinite(value):
+        raise ValidationError(f"{label}必须是有限数值，不能为 NaN 或 ±Inf")
+
+
 def _find_reading_overlap(
     conn: sqlite3.Connection,
     point: str,
@@ -96,10 +108,14 @@ def _find_reading_overlap(
     end_ts: int,
     exclude_number: str | None = None,
 ) -> str | None:
-    """返回与给定区间重叠的已有读数编号，没有则返回 None。"""
+    """返回与给定区间重叠的已有读数编号，没有则返回 None。
+
+    已隔离的读数不参与重叠判定，其时段可用新编号补录。
+    """
     sql = (
         "SELECT number FROM readings "
-        "WHERE point = ? AND role = ? AND start_ts < ? AND end_ts > ?"
+        "WHERE point = ? AND role = ? AND quarantined = 0 "
+        "AND start_ts < ? AND end_ts > ?"
     )
     params: list[object] = [point, role.value, end_ts, start_ts]
     if exclude_number is not None:
@@ -117,10 +133,10 @@ def _find_calibration_overlap(
     end_ts: int,
     exclude_number: str | None = None,
 ) -> str | None:
-    """返回与给定区间重叠的有效（未撤回）校准单编号。"""
+    """返回与给定区间重叠的有效（未撤回、未隔离）校准单编号。"""
     sql = (
         "SELECT number FROM calibrations "
-        "WHERE point = ? AND role = ? AND withdrawn = 0 "
+        "WHERE point = ? AND role = ? AND withdrawn = 0 AND quarantined = 0 "
         "AND start_ts < ? AND end_ts > ?"
     )
     params: list[object] = [point, role.value, end_ts, start_ts]
@@ -141,12 +157,18 @@ def register_reading(conn: sqlite3.Connection, number: str, payload: ReadingIn) 
     读数可补交（任意历史时刻），没有时效限制。
     """
     _validate_interval(payload.start, payload.end)
+    _validate_finite(payload.db, "读数分贝值")
     existing = conn.execute(
         "SELECT * FROM readings WHERE number = ?", (number,)
     ).fetchone()
     now = int(time.time())
 
     if existing is not None:
+        if existing["quarantined"]:
+            # 隔离编号不得再用；其时段可按现有规则用新编号补录。
+            raise ConflictError(
+                f"读数编号 {number} 已因非有限值被隔离，不能复用，请换用新编号"
+            )
         same = (
             existing["point"] == payload.point
             and existing["role"] == payload.role.value
@@ -199,12 +221,17 @@ def upsert_calibration(
     已撤回的编号不可复活，需使用新编号。
     """
     _validate_interval(payload.start, payload.end)
+    _validate_finite(payload.offset, "校准偏移")
     existing = conn.execute(
         "SELECT * FROM calibrations WHERE number = ?", (number,)
     ).fetchone()
     now = int(time.time())
 
     if existing is not None:
+        if existing["quarantined"]:
+            raise ConflictError(
+                f"校准单 {number} 已因非有限值被隔离，不能修改或复活，请使用新编号"
+            )
         if existing["withdrawn"]:
             raise ConflictError(f"校准单 {number} 已撤回，不能修改或复活，请使用新编号")
         if payload.point != existing["point"] or payload.role.value != existing["role"]:
@@ -307,8 +334,8 @@ def _active_calibrations(
     conn: sqlite3.Connection, point: str, role: str
 ) -> list[Calibration]:
     rows = conn.execute(
-        "SELECT * FROM calibrations WHERE point = ? AND role = ? AND withdrawn = 0 "
-        "ORDER BY start_ts",
+        "SELECT * FROM calibrations WHERE point = ? AND role = ? "
+        "AND withdrawn = 0 AND quarantined = 0 ORDER BY start_ts",
         (point, role),
     ).fetchall()
     return [
@@ -359,8 +386,8 @@ def _compute_hour(
     """计算单个测点单个 UTC 小时的结果；无任何覆盖返回 None。"""
     hour_end = hour_start + SECONDS_PER_HOUR
     rows = conn.execute(
-        "SELECT * FROM readings WHERE point = ? AND start_ts < ? AND end_ts > ? "
-        "ORDER BY start_ts, role",
+        "SELECT * FROM readings WHERE point = ? AND quarantined = 0 "
+        "AND start_ts < ? AND end_ts > ? ORDER BY start_ts, role",
         (point, hour_end, hour_start),
     ).fetchall()
     if not rows:
@@ -444,6 +471,64 @@ def recompute_hours(
                     now,
                 ),
             )
+
+
+# --------------------------------------------------------------------------- #
+# 启动隔离：清理旧库残存的非有限单据
+# --------------------------------------------------------------------------- #
+def quarantine_non_finite(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """把库中残存的非有限读数 / 校准单标记为隔离，并只重算受影响的小时。
+
+    仅供启动流程在写事务内调用：隔离标记与受影响小时的重算在同一事务里
+    提交或一起回滚；失败时保留原有记录与结果。本函数幂等，下次启动可重试。
+    返回被隔离的编号清单（按单据类型分组）。
+    """
+    quarantined_readings: list[str] = []
+    quarantined_calibrations: list[str] = []
+    affected: dict[str, set[int]] = {}
+
+    # SQLite 把 NaN 存为 NULL，±Inf 超出一切有限 REAL；预筛后再用
+    # math.isfinite 复核，有限的极大值不误伤。
+    reading_rows = conn.execute(
+        "SELECT * FROM readings WHERE quarantined = 0 "
+        "AND (db_value IS NULL OR db_value > ? OR db_value < ?)",
+        (_FINITE_ABS_BOUND, -_FINITE_ABS_BOUND),
+    ).fetchall()
+    for row in reading_rows:
+        value = row["db_value"]
+        if value is not None and math.isfinite(value):
+            continue
+        conn.execute(
+            "UPDATE readings SET quarantined = 1 WHERE number = ?", (row["number"],)
+        )
+        affected.setdefault(row["point"], set()).update(
+            hours_touching(row["start_ts"], row["end_ts"])
+        )
+        quarantined_readings.append(row["number"])
+
+    calibration_rows = conn.execute(
+        "SELECT * FROM calibrations WHERE quarantined = 0 "
+        "AND (offset_db IS NULL OR offset_db > ? OR offset_db < ?)",
+        (_FINITE_ABS_BOUND, -_FINITE_ABS_BOUND),
+    ).fetchall()
+    for row in calibration_rows:
+        value = row["offset_db"]
+        if value is not None and math.isfinite(value):
+            continue
+        conn.execute(
+            "UPDATE calibrations SET quarantined = 1 WHERE number = ?", (row["number"],)
+        )
+        if not row["withdrawn"]:
+            # 已撤回的单据本就不参与核算，无需重算其窗口。
+            affected.setdefault(row["point"], set()).update(
+                hours_touching(row["start_ts"], row["end_ts"])
+            )
+        quarantined_calibrations.append(row["number"])
+
+    for point, hours in affected.items():
+        recompute_hours(conn, point, sorted(hours))
+
+    return {"readings": quarantined_readings, "calibrations": quarantined_calibrations}
 
 
 # --------------------------------------------------------------------------- #
